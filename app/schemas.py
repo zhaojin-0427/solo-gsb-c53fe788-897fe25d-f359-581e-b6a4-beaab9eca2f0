@@ -93,3 +93,37 @@ class ReportPage(BaseModel):
     runs: list[RunView]
     gaps: list[list[int]]
     divergence_intervals: list[list[int]]
+
+
+# ---- 字节特征定位 ----
+
+
+class SignatureSearchRequest(BaseModel):
+    session_id: str = Field(min_length=1, max_length=128)
+    direction: Direction
+    revision: int = Field(
+        ge=1,
+        description="具体修订号（按会话/方向独立编号，从 1 开始；不支持 latest）",
+    )
+    pattern_base64: str = Field(
+        description="非空字节模式的标准 Base64 编码（空串/解码为空均返回 422）"
+    )
+    offset: int = Field(default=1, ge=1, le=1 << 31, description="分页起点（逻辑偏移）")
+    limit: int = Field(
+        default=100, ge=1, le=10000, description="正整数页大小（返回命中条数上限）"
+    )
+
+
+class SignatureHit(BaseModel):
+    offset: int = Field(description="命中起点逻辑偏移（1 基）")
+    length: int
+    category: Literal["both", "earliest_only", "latest_only"]
+
+
+class SignatureSearchPage(BaseModel):
+    session_id: str
+    direction: Direction
+    revision: int
+    pattern_base64: str
+    page: dict
+    hits: list[SignatureHit]

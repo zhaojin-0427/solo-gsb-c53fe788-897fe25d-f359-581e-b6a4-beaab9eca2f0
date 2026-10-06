@@ -31,7 +31,7 @@ DB_PATH=./data/reassembly.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 ### 运行测试与压测
 
 ```bash
-python3 -m pytest -q            # 21 个功能/HTTP 测试
+python3 -m pytest -q            # 34 个功能/HTTP 测试（含字节特征定位 11 个）
 python3 scripts/stress.py       # 10 万报文、20 MiB 载荷、近 2^31 缺口的内存压测
 ```
 
@@ -87,6 +87,7 @@ python3 scripts/stress.py       # 10 万报文、20 MiB 载荷、近 2^31 缺口
 | POST | `/sessions/{id}/directions/{dir}/revisions` | 按 `expected_revision` 发布修订 |
 | GET | `/sessions/{id}/directions/{dir}/revisions/{rev}` | 修订元信息（`rev` 可为整数或 `latest`） |
 | GET | `/sessions/{id}/directions/{dir}/revisions/{rev}/report` | 分页重组报告 |
+| POST | `/sessions/{id}/directions/{dir}/signature-search` | 在指定修订的两份字节流上定位字节特征（分页命中） |
 
 `{dir}` ∈ `c2s`、`s2c`。报告查询参数：`offset`（默认 1，∈[1,2^31]）、
 `max_bytes`（默认 65536，硬上限 4 MiB）、`max_runs`（默认 2000，硬上限 20000）。
@@ -337,6 +338,153 @@ FIN 之后出现新字节（FIN 在 seq=104 ⇒ fin_pos=4，另有载荷从偏�
 ISN=`0xFFFFFFFE`：seq=`0xFFFFFFFF` 的 `X`、seq=`0` 的 `Y`、seq=`1` 的 `Z` 依次占据逻辑偏移 1、2、3，
 报告正确重组为 `XYZ`（`earliest_base64`/`latest_base64` 解码均为 `XYZ`，`isn=4294967294`）。
 
+### 4.7 字节特征定位（跨 run 命中、双侧分类、分页）
+
+`POST /sessions/{id}/directions/{dir}/signature-search` 在**指定修订**的 earliest / latest
+两份字节流上扫描任意非空字节模式（KMP），请求体：
+
+```json
+{
+  "session_id": "sig-demo",
+  "direction": "c2s",
+  "revision": 1,
+  "pattern_base64": "QUI=",
+  "offset": 1,
+  "limit": 100
+}
+```
+
+- `revision`：**具体修订号**（整数，从 1 开始；不支持 `latest`，未知修订返回 **404**）。
+- `pattern_base64`：**非空**模式的标准 Base64；非法 Base64 或空串/解码为空均返回 **422**。
+- `offset`：分页起点逻辑偏移（默认 1，∈[1,2^31]）；落在缺口内会跳到下一个有字节的 run。
+- `limit`：正整数页大小（默认 100，上限 10000），即本页命中条数上限；0/负数返回 **422**。
+
+返回命中按逻辑起点排序，`category` 表示该起点在哪份流命中：
+
+| category | 含义 |
+|---|---|
+| `both` | earliest 与 latest **两份均命中**（同起点归并为一条） |
+| `earliest_only` | **仅最早**裁决流命中 |
+| `latest_only` | **仅最晚**裁决流命中 |
+
+匹配规则：**允许重叠命中**（`AA` 在 `AAAAA` 中命中 4 次）；**相邻有字节的 run 可构成命中**
+（KMP 状态跨 run、跨读取窗口延续）；**缺口必须截断**——缺口两端字节绝不拼接。
+`page.next_offset` 为下一页起点，末页为 `null`；无命中返回空页（`hits: []`）。
+修订不可变：晚到报文发布新修订后，旧修订的命中结果不变。
+
+#### 构造一个跨 run 命中（与实现一致的真实抓取）
+
+ISN=7000：capture=10 上报偏移 `[1,8)` 的 `ABCDEFGH`；更晚捕获的 capture=20 覆盖偏移 1
+的同一个字节 `A`。扫描线因此把流切成两个相邻 run：`[1,2)` 与 `[2,9)`。模式 `AB` 的两个字节
+**分别落在两个 run**，定位必须让匹配状态跨过 run 边界：
+
+```bash
+curl -s -X POST localhost:8000/sessions -H 'Content-Type: application/json' \
+  -d '{"session_id":"sig-demo"}'
+curl -s -X POST localhost:8000/sessions/sig-demo/directions/c2s/packets \
+  -H 'Content-Type: application/json' -d '{"packets":[
+    {"capture":1,"seq":7000,"syn":true},
+    {"capture":10,"seq":7001,"payload":"QUJDREVGR0g="},
+    {"capture":20,"seq":7001,"payload":"QQ=="}]}'
+curl -s -X POST localhost:8000/sessions/sig-demo/directions/c2s/revisions \
+  -H 'Content-Type: application/json' -d '{"expected_revision":0}'
+```
+发布返回 `run_count: 2`：
+```json
+{"session_id":"sig-demo","direction":"c2s","revision":1,"current_revision":1,
+ "isn":7000,"fin_pos":null,"complete":false,"run_count":2,"gaps":[]}
+```
+
+定位 `AB`（Base64 `QUI=`）——起点偏移 1，**横跨 `[1,2)` 与 `[2,9)` 两个 run**，两份流均命中：
+
+```bash
+curl -s -X POST localhost:8000/sessions/sig-demo/directions/c2s/signature-search \
+  -H 'Content-Type: application/json' -d '{
+    "session_id":"sig-demo","direction":"c2s","revision":1,
+    "pattern_base64":"QUI=","offset":1,"limit":100}'
+```
+```json
+{
+  "session_id":"sig-demo","direction":"c2s","revision":1,
+  "pattern_base64":"QUI=",
+  "page":{"offset":1,"limit":100,"returned":1,"next_offset":null,"done":true},
+  "hits":[{"offset":1,"length":2,"category":"both"}]
+}
+```
+
+无命中返回空页（`next_offset` 为 `null`）：
+```json
+{
+  "session_id":"sig-demo","direction":"c2s","revision":1,
+  "pattern_base64":"Wlpa",
+  "page":{"offset":1,"limit":100,"returned":0,"next_offset":null,"done":true},
+  "hits":[]
+}
+```
+
+#### 重叠命中与分页
+
+`AA` 在 `AAAAA`（偏移 1..5）中允许重叠，共 4 个起点；`limit=2` 分页：
+
+```bash
+curl -s -X POST localhost:8000/sessions/aaaaa/directions/c2s/signature-search \
+  -H 'Content-Type: application/json' -d '{"session_id":"aaaaa","direction":"c2s",
+    "revision":1,"pattern_base64":"QUE=","limit":2}'
+```
+```json
+{
+  "revision":1,"pattern_base64":"QUE=",
+  "page":{"offset":1,"limit":2,"returned":2,"next_offset":3,"done":false},
+  "hits":[
+    {"offset":1,"length":2,"category":"both"},
+    {"offset":2,"length":2,"category":"both"}
+  ]
+}
+```
+带上一页返回的起点续取（`offset=3`），得到偏移 3、4 两条，`next_offset` 为 `null`（末页）。
+
+#### 缺口截断：不拼接缺口两端
+
+`AB` 在偏移 `[1,3)`、`CD` 在 `[10,12)`，中间 `[3,10)` 是缺口；跨缺口的模式 `BC` **不命中**
+（不会把 B 和缺口后的 C 拼起来）：
+```json
+{
+  "revision":1,"pattern_base64":"QkM=",
+  "page":{"offset":1,"limit":100,"returned":0,"next_offset":null,"done":true},
+  "hits":[]
+}
+```
+
+#### 双侧分类：earliest_only / latest_only / both
+
+earliest 流为 `HELLO`、latest 流为 `JELLO`（首字节分歧，见 4.2 的裁决规则）：
+
+- 定位 `HELLO` → `[{"offset":1,"length":5,"category":"earliest_only"}]`
+- 定位 `JELLO`（`SkVMTE8=`）→ `[{"offset":1,"length":5,"category":"latest_only"}]`
+- 定位 `ELLO`（偏移 2 起两份一致）→ `[{"offset":2,"length":4,"category":"both"}]`
+
+#### 旧修订命中不随后发布改变
+
+随后到达 capture=5 的 `ZZZZZZZZ`（捕获更早、上传更晚）并发布修订 2：earliest 被翻转为
+`ZZZZZZZZ`，latest 仍是 `ABCDEFGH`。此时：
+
+- 修订 **1** 上定位 `AB`：命中不变，仍是 `{"offset":1,...,"category":"both"}`；
+- 修订 **2** 上定位 `AB`：earliest 已无此模式，变为
+  `{"offset":1,"length":2,"category":"latest_only"}`。
+
+#### 错误码
+
+```json
+// 非法 Base64 -> 422
+{"detail":{"error":"invalid_base64","message":"pattern_base64 不是合法的标准 Base64"}}
+// 空模式 -> 422
+{"detail":{"error":"empty_pattern","message":"pattern_base64 为空"}}
+// 未知修订 -> 404
+{"detail":"修订 99 不存在"}
+```
+
+以上示例可用 `scripts/signature_demo.sh`（需先 `docker compose up`）一键复跑。
+
 ---
 
 ## 5. 工程实现与内存
@@ -350,6 +498,11 @@ ISN=`0xFFFFFFFE`：seq=`0xFFFFFFFF` 的 `X`、seq=`0` 的 `Y`、seq=`1` 的 `Z` 
   用 SQLite `substr(payload, …)` 只读取所需载荷窗口；近 2^31 的缺口只是两个 run 之间的整数差，不占字节。
 - 修订与 run 使用 `(session_id, direction, revision)` 复合主键，修订号每方向独立；请求连接短开短关，
   无跨线程共享。
+- **字节特征定位（`app/signature.py`）不物化任何流**：从指定修订逐批（每批 1000 run）读取 run，
+  经同一 `payload_slices` 窗口读取还原 earliest/latest 字节，喂给两台 KMP 自动机。KMP 完整匹配后
+  沿 failure 边回退（允许重叠）；相邻 run（末端相接）状态延续，模式可跨 run、跨读取批次；
+  run 间存在缺口时状态清零（绝不拼接）。两侧命中按起点归并，同起点合并为 `both`；分页无状态，
+  每侧取数不足时按需续扫以确定 `next_offset`。
 
 表结构见 `app/db.py` 中的 `SCHEMA`。
 
@@ -361,7 +514,9 @@ app/schemas.py      请求与响应模型
 app/reassembly.py   相对序号、发布校验、扫描线 earliest/latest 裁决、缺口/完整性
 app/db.py           SQLite 存储、发布事务、run 快照、载荷窗口读取
 app/report.py       分页报告构建（缺口不补零、run 内分块、逐字节分歧区间）
+app/signature.py    字节特征定位（KMP、跨 run/跨窗口状态、缺口截断、双侧归并分页）
 scripts/stress.py   10 万报文 / 20 MiB / 近 2^31 缺口压测
-tests/              21 个单元 + HTTP 端到端测试
+scripts/signature_demo.sh  字节特征定位跨 run 命中端到端演示
+tests/              34 个单元 + HTTP 端到端测试（含字节特征定位 11 个）
 docker-compose.yml  一键启动（命名卷持久化）
 ```

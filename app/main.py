@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
-from . import db, report
+from . import db, report, signature
 from .reassembly import LIMIT, PublishRejected, RevisionConflict
 from .report import (
     DEFAULT_MAX_BYTES,
@@ -27,6 +27,8 @@ from .schemas import (
     ReportPage,
     RevisionMeta,
     SessionResponse,
+    SignatureSearchPage,
+    SignatureSearchRequest,
     UploadRequest,
 )
 
@@ -275,6 +277,77 @@ def get_report(
             raise HTTPException(422, detail=str(exc))
         if page is None:
             raise HTTPException(404, detail=f"修订 {rev} 不存在")
+        return page
+    finally:
+        conn.close()
+
+
+@app.post(
+    "/sessions/{session_id}/directions/{direction}/signature-search",
+    response_model=SignatureSearchPage,
+)
+def search_signature(
+    session_id: str,
+    direction: str,
+    body: SignatureSearchRequest,
+    request: Request,
+):
+    """在已发布修订的 earliest/latest 两份字节流上定位字节特征。"""
+    _check_direction(direction)
+    # 路径与正文的会话必须一致（正文提供具体修订号等全部参数）
+    if body.session_id != session_id:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "session_mismatch",
+                "message": "路径会话与请求体会话不一致",
+            },
+        )
+    if body.direction != direction:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "direction_mismatch",
+                "message": "路径方向与请求体方向不一致",
+            },
+        )
+    if not body.pattern_base64:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "empty_pattern", "message": "pattern_base64 为空"},
+        )
+    try:
+        pattern = base64.b64decode(body.pattern_base64, validate=True)
+    except (binascii.Error, ValueError):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "invalid_base64",
+                "message": "pattern_base64 不是合法的标准 Base64",
+            },
+        )
+    if not pattern:
+        raise HTTPException(
+            status_code=422,
+            detail={"error": "empty_pattern", "message": "模式解码后为空"},
+        )
+
+    conn = get_conn(request)
+    try:
+        _require_session(conn, session_id)
+        page = signature.search_page(
+            conn,
+            session_id,
+            direction,
+            body.revision,
+            pattern,
+            body.offset,
+            body.limit,
+        )
+        if page is None:
+            raise HTTPException(
+                status_code=404, detail=f"修订 {body.revision} 不存在"
+            )
         return page
     finally:
         conn.close()
