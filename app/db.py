@@ -358,6 +358,30 @@ def get_revision_meta(conn: sqlite3.Connection, session_id: str, direction: str,
     }
 
 
+def iter_runs(
+    conn: sqlite3.Connection,
+    session_id: str,
+    direction: str,
+    revision: int,
+    start_idx: int,
+    min_end: int,
+    limit: int,
+):
+    """按 idx 升序顺序取一页修订 run（idx >= start_idx 且 end_offset > min_end）。
+
+    供字节特征定位流式扫描：调用方把上一批最后一条的 idx+1 作为 start_idx
+    继续取下一批；缺口由相邻 run 的 start/end 差值判定，不在 SQL 层补全。
+    """
+    return conn.execute(
+        "SELECT idx, start_offset AS s, end_offset AS e,"
+        " earliest_packet AS ep, earliest_capture AS ec,"
+        " latest_packet AS lp, latest_capture AS lc, divergent AS d"
+        " FROM runs WHERE session_id=? AND direction=? AND revision=?"
+        " AND idx>=? AND end_offset>? ORDER BY idx LIMIT ?",
+        (session_id, direction, revision, start_idx, min_end, limit),
+    ).fetchall()
+
+
 def payload_slices(conn: sqlite3.Connection, refs):
     """refs: [(packet_id, logical_start, logical_end)] -> 对应字节片列表。
 

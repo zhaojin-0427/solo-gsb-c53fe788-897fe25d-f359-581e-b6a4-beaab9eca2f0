@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
-from . import db, report
+from . import db, report, search
 from .reassembly import LIMIT, PublishRejected, RevisionConflict
 from .report import (
     DEFAULT_MAX_BYTES,
@@ -22,6 +22,8 @@ from .report import (
 from .schemas import (
     CreateSessionRequest,
     DirectionState,
+    LocatePage,
+    LocateRequest,
     PublishRequest,
     PublishResponse,
     ReportPage,
@@ -45,8 +47,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="TCP 会话重组 API",
-    version="1.0.0",
-    description="按会话/方向接收乱序报文，以唯一 SYN 为锚发布修订并分页重组。",
+    version="1.1.0",
+    description=(
+        "按会话/方向接收乱序报文，以唯一 SYN 为锚发布修订并分页重组，"
+        "并支持在指定修订的双份字节流上做字节特征定位。"
+    ),
     lifespan=lifespan,
 )
 
@@ -70,6 +75,42 @@ def _check_direction(direction: str) -> None:
         raise HTTPException(
             status_code=400, detail="direction 必须是 'c2s' 或 's2c'"
         )
+
+
+def _resolve_revision(conn, session_id: str, direction: str, revision: str) -> int:
+    """路径中的修订号：整数或 'latest'。方向无修订返回 404。"""
+    if revision == "latest":
+        rev = db.current_revision(conn, session_id, direction)
+        if rev is None:
+            raise HTTPException(404, detail="该方向尚无修订，先发布")
+        return rev
+    try:
+        return int(revision)
+    except ValueError:
+        raise HTTPException(400, detail="revision 必须是整数或 'latest'")
+
+
+def _decode_pattern(pattern_b64: str) -> bytes:
+    """定位接口的模式必须是合法 Base64 且解码后非空，否则 422。"""
+    try:
+        pattern = base64.b64decode(pattern_b64, validate=True)
+    except (binascii.Error, ValueError):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "invalid_base64",
+                "message": "pattern_base64 不是合法 Base64",
+            },
+        )
+    if not pattern:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "empty_pattern",
+                "message": "pattern_base64 解码后为空，模式必须非空",
+            },
+        )
+    return pattern
 
 
 @app.post("/sessions", response_model=SessionResponse, status_code=201)
@@ -224,15 +265,7 @@ def get_revision(session_id: str, direction: str, revision: str, request: Reques
     conn = get_conn(request)
     try:
         _require_session(conn, session_id)
-        if revision == "latest":
-            rev = db.current_revision(conn, session_id, direction)
-            if rev is None:
-                raise HTTPException(404, detail="该方向尚无修订，先发布")
-        else:
-            try:
-                rev = int(revision)
-            except ValueError:
-                raise HTTPException(400, detail="revision 必须是整数或 'latest'")
+        rev = _resolve_revision(conn, session_id, direction, revision)
         meta = db.get_revision_meta(conn, session_id, direction, rev)
         if meta is None:
             raise HTTPException(404, detail=f"修订 {rev} 不存在")
@@ -258,21 +291,42 @@ def get_report(
     conn = get_conn(request)
     try:
         _require_session(conn, session_id)
-        if revision == "latest":
-            rev = db.current_revision(conn, session_id, direction)
-            if rev is None:
-                raise HTTPException(404, detail="该方向尚无修订，先发布")
-        else:
-            try:
-                rev = int(revision)
-            except ValueError:
-                raise HTTPException(400, detail="revision 必须是整数或 'latest'")
+        rev = _resolve_revision(conn, session_id, direction, revision)
         try:
             page = report.build_page(
                 conn, session_id, direction, rev, offset, max_bytes, max_runs
             )
         except ValueError as exc:
             raise HTTPException(422, detail=str(exc))
+        if page is None:
+            raise HTTPException(404, detail=f"修订 {rev} 不存在")
+        return page
+    finally:
+        conn.close()
+
+
+@app.post(
+    "/sessions/{session_id}/directions/{direction}/revisions/{revision}/locate",
+    response_model=LocatePage,
+)
+def locate_pattern(session_id: str, direction: str, revision: str,
+                   body: LocateRequest, request: Request):
+    """字节特征定位：在指定修订的 earliest/latest 两份字节流中查找模式命中。"""
+    _check_direction(direction)
+    conn = get_conn(request)
+    try:
+        _require_session(conn, session_id)
+        rev = _resolve_revision(conn, session_id, direction, revision)
+        pattern = _decode_pattern(body.pattern_base64)
+        page = search.locate_pattern(
+            conn,
+            session_id,
+            direction,
+            rev,
+            pattern,
+            body.offset,
+            body.limit,
+        )
         if page is None:
             raise HTTPException(404, detail=f"修订 {rev} 不存在")
         return page

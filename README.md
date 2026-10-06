@@ -4,6 +4,10 @@
 以每方向**唯一 SYN 为锚**发布不可变**修订 (revision)**，对重叠区分别给出 **earliest（最早捕获）** 与
 **latest（最晚捕获）** 两份重组结果，并按页返回字节片段、来源、逐字节分歧区间和缺口区间。
 
+此外提供**字节特征定位 API**（`POST .../revisions/{rev}/locate`）：对**指定修订**还原两份字节流，
+在其中定位任意 Base64 字节特征，返回按逻辑偏移排序的命中起点、下一页起点和
+`both / earliest_only / latest_only` 双侧命中类别，支持重叠命中与跨 run 命中。
+
 报文可以**任意乱序上传**（先传数据、后传 SYN 也可以），结果只取决于全部报文的内容，与上传顺序无关。
 
 ---
@@ -31,7 +35,7 @@ DB_PATH=./data/reassembly.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 ### 运行测试与压测
 
 ```bash
-python3 -m pytest -q            # 21 个功能/HTTP 测试
+python3 -m pytest -q            # 35 个功能/HTTP 测试（含字节特征定位 12 例）
 python3 scripts/stress.py       # 10 万报文、20 MiB 载荷、近 2^31 缺口的内存压测
 ```
 
@@ -87,10 +91,40 @@ python3 scripts/stress.py       # 10 万报文、20 MiB 载荷、近 2^31 缺口
 | POST | `/sessions/{id}/directions/{dir}/revisions` | 按 `expected_revision` 发布修订 |
 | GET | `/sessions/{id}/directions/{dir}/revisions/{rev}` | 修订元信息（`rev` 可为整数或 `latest`） |
 | GET | `/sessions/{id}/directions/{dir}/revisions/{rev}/report` | 分页重组报告 |
+| POST | `/sessions/{id}/directions/{dir}/revisions/{rev}/locate` | 字节特征定位（跨 run、双侧分类、分页） |
 
 `{dir}` ∈ `c2s`、`s2c`。报告查询参数：`offset`（默认 1，∈[1,2^31]）、
 `max_bytes`（默认 65536，硬上限 4 MiB）、`max_runs`（默认 2000，硬上限 20000）。
 页末返回 `page.next_offset`；为 `null` 表示已到末尾。落在缺口中间的 `offset` 会直接跳到下一个有字节的行程。
+
+### 字节特征定位 `POST .../locate`
+
+请求体（JSON）：
+
+| 字段 | 说明 |
+|---|---|
+| `pattern_base64` | **非空**标准 Base64 模式；解码后即要定位的字节特征。非法 Base64 → **422 `invalid_base64`**，空模式（`""` 或全填充）→ **422 `empty_pattern`** |
+| `offset` | 分页起点（逻辑偏移，默认 1，∈[1,2^31]）；只返回起点 `>= offset` 的命中 |
+| `limit` | 正整数页大小（默认 100，∈[1,10000]）；本页最多返回的命中条数 |
+
+响应：
+
+- `hits[]`：按逻辑偏移升序；`offset` 为模式首字节的逻辑偏移，`category` 为
+  **`both`（earliest/latest 两份均命中且同起点）/ `earliest_only`（仅最早捕获侧）/
+  `latest_only`（仅最晚捕获侧）**，同起点两侧各命中时归并为一条 `both`。
+- `next_offset`：下一页起点（取本页之后第 1 条命中的偏移），**末页为 `null`**，`done=true`；
+  下一页请求把它作为新的 `offset` 即可。
+- 修订不存在（含 `latest` 但该方向从未发布）→ **404**；**无命中返回空页**（`hits: []`、`next_offset: null`）。
+
+定位语义（与实现一致）：
+
+- 检索从**指定修订**固化的 run（仅逻辑区间 + 来源报文引用）**还原 earliest/latest 两份字节流**，
+  再逐窗口读取来源报文载荷；**晚到报文发布新修订后，旧修订的命中保持不变**。
+- **允许重叠命中**：如 `aa` 在 `aaaa` 中命中偏移 1、2、3。
+- **相邻有字节的 run 构成连续字节，允许跨 run 命中**；run 之间一旦存在缺口，
+  立即丢弃匹配状态、**绝不拼接缺口两端**（缺口对特征定位是硬截断）。
+- KMP 匹配状态跨“读取窗口（64 KiB）/ run / 报告式分页读取”边界保持，
+  因此跨越窗口或 run 边界的特征也能命中；匹配按 run 流式扫描，不物化整版字节流。
 
 报文对象：
 
@@ -337,6 +371,157 @@ FIN 之后出现新字节（FIN 在 seq=104 ⇒ fin_pos=4，另有载荷从偏�
 ISN=`0xFFFFFFFE`：seq=`0xFFFFFFFF` 的 `X`、seq=`0` 的 `Y`、seq=`1` 的 `Z` 依次占据逻辑偏移 1、2、3，
 报告正确重组为 `XYZ`（`earliest_base64`/`latest_base64` 解码均为 `XYZ`，`isn=4294967294`）。
 
+### 4.7 字节特征定位：跨 run 命中、双侧分类、缺口截断、分页、旧修订不变
+
+会话 `sig`，ISN=1000。报文（故意让不同 run 归属不同来源、两份字节流在偏移 2 处分歧）：
+
+| capture | seq | 载荷 | 逻辑区间 |
+|---|---|---|---|
+| 1 | 1000 | SYN | 锚点 |
+| 10 | 1001 | `AB`（`QUI=`） | [1,3) |
+| 20 | 1002 | `xC`（`eEM=`） | [2,4) |
+| 30 | 1004 | `DE`（`REU=`） | [4,6) |
+| 40 | 1008 | `FGH`（`RkdI=`） | [8,11)，前面 **[6,8) 是缺口** |
+
+于是 **earliest 流**（按最早捕获裁决）为偏移 1..5 的 `ABCDE`，
+**latest 流**（按最晚捕获裁决）为偏移 1..5 的 `AxCDE`；偏移 8..10 两份均为 `FGH`。
+
+```bash
+curl -s -X POST localhost:8000/sessions -H 'Content-Type: application/json' \
+  -d '{"session_id":"sig"}'
+curl -s -X POST localhost:8000/sessions/sig/directions/c2s/packets \
+  -H 'Content-Type: application/json' -d '{"packets":[{"capture":1,"seq":1000,"syn":true}]}'
+curl -s -X POST localhost:8000/sessions/sig/directions/c2s/packets \
+  -H 'Content-Type: application/json' \
+  -d '{"packets":[{"capture":10,"seq":1001,"payload":"QUI="},
+                  {"capture":20,"seq":1002,"payload":"eEM="},
+                  {"capture":30,"seq":1004,"payload":"REU="},
+                  {"capture":40,"seq":1008,"payload":"RkdI="}]}'
+curl -s -X POST localhost:8000/sessions/sig/directions/c2s/revisions \
+  -H 'Content-Type: application/json' -d '{"expected_revision":0}'
+```
+```json
+{"session_id":"sig","direction":"c2s","revision":1,"current_revision":1,
+ "isn":1000,"fin_pos":null,"complete":false,"run_count":5,"gaps":[[6,8]]}
+```
+
+**跨 run 命中 `CDE`（`Q0RF`）**：`C` 在 run（capture=20，区间 [2,4)），`DE` 在相邻 run
+（capture=30，区间 [4,6)）。两个 run 相邻无缺口，因此跨越 run 边界命中于偏移 3，
+两份流在此一致 → `both`：
+
+```bash
+curl -s -X POST localhost:8000/sessions/sig/directions/c2s/revisions/1/locate \
+  -H 'Content-Type: application/json' -d '{"pattern_base64":"Q0RF"}'
+```
+```json
+{"session_id":"sig","direction":"c2s","revision":1,"pattern_base64":"Q0RF",
+ "offset":1,"limit":100,
+ "hits":[{"offset":3,"category":"both"}],"next_offset":null,"done":true}
+```
+
+**跨 run 但仅一侧命中 `BC`（`QkM=`）**：`B` 只存在于 earliest 流（偏移 2 处 latest 是 `x`），
+`C` 两份一致；命中跨 capture=10 / capture=20 两个 run，起点 2 → `earliest_only`。
+`xC`（`eEM=`）则只在 latest 流 → `latest_only`：
+
+```bash
+curl -s -X POST localhost:8000/sessions/sig/directions/c2s/revisions/1/locate \
+  -H 'Content-Type: application/json' -d '{"pattern_base64":"QkM="}'
+curl -s -X POST localhost:8000/sessions/sig/directions/c2s/revisions/1/locate \
+  -H 'Content-Type: application/json' -d '{"pattern_base64":"eEM="}'
+```
+```json
+{"revision":1,"pattern_base64":"QkM=","hits":[{"offset":2,"category":"earliest_only"}],
+ "next_offset":null,"done":true}
+```
+```json
+{"revision":1,"pattern_base64":"eEM=","hits":[{"offset":2,"category":"latest_only"}],
+ "next_offset":null,"done":true}
+```
+
+**缺口硬截断 `EF`（`RUY=`）**：`E` 在偏移 5，`F` 在偏移 8，中间 `[6,8)` 是缺口。
+缺口两侧**不拼接**，故无命中（空页）；而缺口之后、相邻 run 内的 `GH`（`R0g=`）
+正常命中偏移 9：
+
+```bash
+curl -s -X POST localhost:8000/sessions/sig/directions/c2s/revisions/1/locate \
+  -H 'Content-Type: application/json' -d '{"pattern_base64":"RUY="}'
+curl -s -X POST localhost:8000/sessions/sig/directions/c2s/revisions/1/locate \
+  -H 'Content-Type: application/json' -d '{"pattern_base64":"R0g="}'
+```
+```json
+{"revision":1,"pattern_base64":"RUY=","hits":[],"next_offset":null,"done":true}
+```
+```json
+{"revision":1,"pattern_base64":"R0g=","hits":[{"offset":9,"category":"both"}],
+ "next_offset":null,"done":true}
+```
+
+**分页（重叠命中）**：会话 `pg` 的流为 `aaaabaaaaa`（10 字节，`YWFhYWJhYWFhYQ==`），
+模式 `aa`（`YWE=`）允许重叠，命中偏移 `1,2,3,6,7,8,9`。`limit=3` 时逐页跟随
+`next_offset`：
+
+```bash
+curl -s -X POST localhost:8000/sessions/pg/directions/c2s/revisions/1/locate \
+  -H 'Content-Type: application/json' -d '{"pattern_base64":"YWE=","offset":1,"limit":3}'
+```
+```json
+{"revision":1,"pattern_base64":"YWE=","offset":1,"limit":3,
+ "hits":[{"offset":1,"category":"both"},{"offset":2,"category":"both"},
+         {"offset":3,"category":"both"}],
+ "next_offset":6,"done":false}
+```
+```bash
+curl -s -X POST localhost:8000/sessions/pg/directions/c2s/revisions/1/locate \
+  -H 'Content-Type: application/json' -d '{"pattern_base64":"YWE=","offset":6,"limit":3}'
+```
+```json
+{"revision":1,"pattern_base64":"YWE=","offset":6,"limit":3,
+ "hits":[{"offset":6,"category":"both"},{"offset":7,"category":"both"},
+         {"offset":8,"category":"both"}],
+ "next_offset":9,"done":false}
+```
+```bash
+curl -s -X POST localhost:8000/sessions/pg/directions/c2s/revisions/1/locate \
+  -H 'Content-Type: application/json' -d '{"pattern_base64":"YWE=","offset":9,"limit":3}'
+```
+```json
+{"revision":1,"pattern_base64":"YWE=","offset":9,"limit":3,
+ "hits":[{"offset":9,"category":"both"}],"next_offset":null,"done":true}
+```
+
+**非法 / 空模式 → 422，未知修订 → 404**：
+
+```bash
+curl -s -X POST localhost:8000/sessions/sig/directions/c2s/revisions/1/locate \
+  -H 'Content-Type: application/json' -d '{"pattern_base64":"@@@"}'
+# 422 {"detail":{"error":"invalid_base64","message":"pattern_base64 不是合法 Base64"}}
+curl -s -X POST localhost:8000/sessions/sig/directions/c2s/revisions/1/locate \
+  -H 'Content-Type: application/json' -d '{"pattern_base64":""}'
+# 422 {"detail":{"error":"empty_pattern","message":"pattern_base64 解码后为空，模式必须非空"}}
+curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+  localhost:8000/sessions/sig/directions/c2s/revisions/9/locate \
+  -H 'Content-Type: application/json' -d '{"pattern_base64":"QUI="}'
+# 404
+```
+
+**旧修订命中不可变**：随后到达捕获更早的 capture=5 `YZ`（`Wlo=`，覆盖 [1,3)），
+发布修订 2 后 earliest 翻转为 `YZCDE`。修订 2 上 `BC` 已不命中、`YZ` 仅 earliest 命中，
+而**修订 1 上 `BC` 仍是 `earliest_only @2`**；跨 run 的 `CDE` 在两版上都命中于 3：
+
+```bash
+curl -s -X POST localhost:8000/sessions/sig/directions/c2s/packets \
+  -H 'Content-Type: application/json' -d '{"packets":[{"capture":5,"seq":1001,"payload":"Wlo="}]}'
+curl -s -X POST localhost:8000/sessions/sig/directions/c2s/revisions \
+  -H 'Content-Type: application/json' -d '{"expected_revision":1}'
+# {"revision":2,...,"run_count":5,"gaps":[[6,8]]}
+```
+```json
+修订 1 / BC : {"hits":[{"offset":2,"category":"earliest_only"}],"done":true}
+修订 2 / BC : {"hits":[],"next_offset":null,"done":true}
+修订 2 / YZ : {"hits":[{"offset":1,"category":"earliest_only"}],"done":true}
+修订 2 / CDE: {"hits":[{"offset":3,"category":"both"}],"done":true}
+```
+
 ---
 
 ## 5. 工程实现与内存
@@ -348,6 +533,12 @@ ISN=`0xFFFFFFFE`：seq=`0xFFFFFFFF` 的 `X`、seq=`0` 的 `Y`、seq=`1` 的 `Z` 
   与来源报文引用。
 - **报告不物化缺口/整流**：按 `(session,direction,revision)` 复合键索引 run，按页只取与本页相交的 run，
   用 SQLite `substr(payload, …)` 只读取所需载荷窗口；近 2^31 的缺口只是两个 run 之间的整数差，不占字节。
+- **字节特征定位复用同一 run 快照**：`app/search.py` 按 idx 流式逐 run 读取（每批 2000 条），
+  每个 run 再按 64 KiB 窗口用 `payload_slices` 取两侧字节，对 earliest/latest 各跑一个
+  **有状态 KMP**（重叠命中：匹配后回退到最长真前后缀）。匹配状态跨读取窗口与 run 边界保持，
+  一旦相邻 run 之间出现缺口（`next.start > prev.end`）立即 `reset()`，绝不拼接缺口两端；
+  两侧命中各自有序，再按同起点归并为 `both / earliest_only / latest_only`。
+  扫描只读不可变 run 与原始报文，不复制整版字节流，旧修订的命中不随后续发布变化。
 - 修订与 run 使用 `(session_id, direction, revision)` 复合主键，修订号每方向独立；请求连接短开短关，
   无跨线程共享。
 
@@ -359,9 +550,10 @@ ISN=`0xFFFFFFFE`：seq=`0xFFFFFFFF` 的 `X`、seq=`0` 的 `Y`、seq=`1` 的 `Z` 
 app/main.py         HTTP 路由 / 错误码映射
 app/schemas.py      请求与响应模型
 app/reassembly.py   相对序号、发布校验、扫描线 earliest/latest 裁决、缺口/完整性
-app/db.py           SQLite 存储、发布事务、run 快照、载荷窗口读取
+app/db.py           SQLite 存储、发布事务、run 快照、载荷窗口读取、run 顺序迭代
 app/report.py       分页报告构建（缺口不补零、run 内分块、逐字节分歧区间）
+app/search.py       字节特征定位（跨窗口/跨 run 有状态 KMP、缺口截断、双侧归并分页）
 scripts/stress.py   10 万报文 / 20 MiB / 近 2^31 缺口压测
-tests/              21 个单元 + HTTP 端到端测试
-docker-compose.yml  一键启动（命名卷持久化）
+tests/              35 个单元 + HTTP 端到端测试（含 test_locate.py 12 例）
+docker-compose.yml  一键启动重组 + 字节特征定位服务（命名卷持久化）
 ```

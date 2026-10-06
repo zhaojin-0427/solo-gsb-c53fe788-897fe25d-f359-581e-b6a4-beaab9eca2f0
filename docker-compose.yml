@@ -1,4 +1,5 @@
 services:
+  # TCP 重组 + 字节特征定位服务（/locate）。同一进程同时提供原有发布/报告接口。
   tcp-reassembly:
     build: .
     image: tcp-reassembly:latest

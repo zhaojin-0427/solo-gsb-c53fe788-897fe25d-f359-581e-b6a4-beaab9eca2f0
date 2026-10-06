@@ -93,3 +93,34 @@ class ReportPage(BaseModel):
     runs: list[RunView]
     gaps: list[list[int]]
     divergence_intervals: list[list[int]]
+
+
+class LocateRequest(BaseModel):
+    pattern_base64: str = Field(
+        description="非空标准 Base64 模式；解码后即要在两份字节流中定位的字节特征"
+    )
+    offset: int = Field(
+        default=1, ge=1, le=1 << 31, description="分页起点（逻辑偏移），只返回 >= 该值的命中"
+    )
+    limit: int = Field(
+        default=100, ge=1, le=10000, description="正整数页大小：本页最多返回的命中条数"
+    )
+
+
+class PatternHit(BaseModel):
+    offset: int = Field(description="命中起点（模式首字节的逻辑偏移，1 起）")
+    category: Literal["both", "earliest_only", "latest_only"] = Field(
+        description="两份字节流均命中 / 仅最早捕获侧 / 仅最晚捕获侧"
+    )
+
+
+class LocatePage(BaseModel):
+    session_id: str
+    direction: Direction
+    revision: int
+    pattern_base64: str
+    offset: int
+    limit: int
+    hits: list[PatternHit]
+    next_offset: int | None
+    done: bool
